@@ -1,0 +1,2 @@
+# Installed DHCPD and Named for DNS
+sudo dnf install dhcp-server bind bind-utils

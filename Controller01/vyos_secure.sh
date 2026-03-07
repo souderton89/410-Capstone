@@ -2183,7 +2183,7 @@ nat_menu() {
 }
 
 # -----------------------------
-# Interfaces
+# Interfaces (original simple menu — kept for compatibility)
 # -----------------------------
 iface_set_ip() {
   local ifs=() iface ip desc yn
@@ -2609,36 +2609,9 @@ dns_forwarding_menu() {
 
 # ============================================================
 # RIP Submenu
-# Corrected to match actual VyOS RIP configuration syntax.
-#
-# VyOS RIP config lives under TWO places:
-#   (A) set protocols rip ...         — global RIP settings
-#   (B) set interfaces ethernet <if> ip rip ...  — per-interface RIP settings
-#
-# Supported commands covered here:
-#   set protocols rip interface <iface>
-#   set protocols rip network <A.B.C.D/M>
-#   set protocols rip neighbor <A.B.C.D>
-#   set protocols rip passive-interface interface <iface>
-#   set protocols rip passive-interface interface default
-#   set protocols rip redistribute <source> [metric <1-16>]
-#   set protocols rip default-information originate
-#   set protocols rip default-distance <1-255>
-#   set protocols rip timers update <seconds>
-#   set protocols rip timers timeout <seconds>
-#   set protocols rip timers garbage-collection <seconds>
-#   set protocols rip route <A.B.C.D/M>           (static RIP-only route)
-#   set interfaces <type> <name> ip rip split-horizon [disable|poison-reverse]
-#   set interfaces <type> <name> ip rip authentication mode [md5|plaintext]
-#   set interfaces <type> <name> ip rip authentication md5 <keyid> password <pw>
-#   set interfaces <type> <name> ip rip authentication plaintext-password <pw>
 # ============================================================
 
-# ----------------------------
-# RIP scan helpers
-# ----------------------------
 scan_rip_interfaces() {
-  # set protocols rip interface <iface>
   get_cfg_cmds \
     | grep -F "set protocols rip interface " \
     | awk '{print $5}' \
@@ -2647,7 +2620,6 @@ scan_rip_interfaces() {
 }
 
 scan_rip_networks() {
-  # set protocols rip network <CIDR>
   get_cfg_cmds \
     | grep -F "set protocols rip network " \
     | awk '{print $5}' \
@@ -2656,7 +2628,6 @@ scan_rip_networks() {
 }
 
 scan_rip_neighbors() {
-  # set protocols rip neighbor <IP>
   get_cfg_cmds \
     | grep -F "set protocols rip neighbor " \
     | awk '{print $5}' \
@@ -2665,7 +2636,6 @@ scan_rip_neighbors() {
 }
 
 scan_rip_passive_interfaces() {
-  # set protocols rip passive-interface interface <iface|default>
   get_cfg_cmds \
     | grep -F "set protocols rip passive-interface interface " \
     | awk '{print $6}' \
@@ -2674,7 +2644,6 @@ scan_rip_passive_interfaces() {
 }
 
 scan_rip_redistribute() {
-  # set protocols rip redistribute <source>
   get_cfg_cmds \
     | grep -F "set protocols rip redistribute " \
     | awk '{print $5}' \
@@ -2683,7 +2652,6 @@ scan_rip_redistribute() {
 }
 
 scan_rip_static_routes() {
-  # set protocols rip route <CIDR>  (RIP-only static route)
   get_cfg_cmds \
     | grep -F "set protocols rip route " \
     | awk '{print $5}' \
@@ -2692,17 +2660,11 @@ scan_rip_static_routes() {
 }
 
 scan_rip_iface_settings() {
-  # set interfaces ethernet <if> ip rip ...
-  # Returns lines for display only
   get_cfg_cmds \
     | grep -F " ip rip " \
     | sort -u
 }
 
-# FIX-9: run_cmd_to_tty uses unquoted $cmd intentionally.
-# 'run' is VyOS's built-in wrapper (not /usr/bin/run) and requires
-# arguments to be passed via word-splitting, not as a single quoted string.
-# Do NOT quote $cmd here.
 run_cmd_to_tty() {
   local cmd="$1"
   tprint ""
@@ -2715,15 +2677,7 @@ run_cmd_to_tty() {
   tprint "--------------------------------------------------------"
 }
 
-# ----------------------------
-# RIP: List config + runtime
-# FIX-Issue5: Show neighbor/passive relationship clearly so operators
-# can verify the passive-interface default + neighbor unicast pattern.
-# FIX-Issue1: Correctly label neighbors as unicast peers, not next-hops.
-# ----------------------------
 rip_neighbor_context_warning() {
-  # Shared helper — prints the neighbor/passive relationship for the operator.
-  # Called from both rip_list_config and rip_add_neighbor_safe.
   local neighbors=() passive=()
   load_array neighbors scan_rip_neighbors
   load_array passive scan_rip_passive_interfaces
@@ -2779,7 +2733,6 @@ rip_list_config() {
   tprint "  static routes:      $(scan_rip_static_routes | join_lines)"
   tprint ""
 
-  # FIX-Issue5: neighbors shown with full context, not as a plain list
   rip_neighbor_context_warning
 
   tprint "--- All protocols rip commands ---"
@@ -2799,7 +2752,6 @@ rip_list_config() {
   fi
   tprint "--------------------------------------------------------"
 
-  # Runtime operational data
   run_cmd_to_tty "show ip rip"
   run_cmd_to_tty "show ip rip status"
   run_cmd_to_tty "show ip route rip"
@@ -2807,10 +2759,6 @@ rip_list_config() {
   pause
 }
 
-# ----------------------------
-# RIP: Interface (enable RIP on interface)
-# set protocols rip interface <iface>
-# ----------------------------
 rip_add_interface_safe() {
   local current=() ifs=() iface yn
   load_array current scan_rip_interfaces
@@ -2885,10 +2833,6 @@ rip_delete_interface_existing() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP: Network (advertise a CIDR prefix)
-# set protocols rip network <A.B.C.D/M>
-# ----------------------------
 rip_add_network_safe() {
   local current=() net yn
   load_array current scan_rip_networks
@@ -2952,29 +2896,7 @@ rip_delete_network_existing() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP: Neighbor (unicast peer)
-# set protocols rip neighbor <A.B.C.D>
-#
-# FIX-Issue1: Correctly named "unicast peer". In VyOS RIP, "neighbor" sends
-#   updates to that IP as unicast. It is NOT a next-hop setting.
-#   Next-hop in RIP is implicit (the advertising router's IP) and is not
-#   directly configurable via a set protocols rip next-hop command.
-#
-# FIX-Issue2: Added reachability check — warns if the neighbor IP does not
-#   fall within any RIP-enabled interface subnet.
-#
-# FIX-Issue3: Added passive-interface relationship check — warns if
-#   passive-interface default is NOT set (neighbor entries are redundant
-#   without it) and warns if passive-interface default IS set but this
-#   would be the first neighbor (critical to add to avoid RIP going silent).
-#
-# FIX-Issue4: Uses is_in_list (not is_number_in_list) for IP deduplication.
-# ----------------------------
 rip_neighbor_reachable_via_rip() {
-  # Returns 0 if the given IP falls within any RIP interface subnet.
-  # Returns 1 if no match found (neighbor may be unreachable via RIP).
-  # Uses the configured interface addresses from running config.
   local neighbor_ip="$1"
   local rip_ifaces=()
   load_array rip_ifaces scan_rip_interfaces
@@ -2983,13 +2905,11 @@ rip_neighbor_reachable_via_rip() {
     return 1
   fi
 
-  # Convert neighbor IP to integer
   local n_int
   n_int="$(printf "%s" "$neighbor_ip" | awk -F. '{printf "%d", ($1*16777216)+($2*65536)+($3*256)+$4}')"
 
   local iface
   for iface in "${rip_ifaces[@]}"; do
-    # Get address/prefix configured on this interface
     local addr_cidr
     addr_cidr="$(get_cfg_cmds | grep -F "set interfaces ethernet $iface address " | awk '"'"'{print $6}'"'"' | head -n 1 | while read -r x; do strip_quotes "$x"; done)"
     [ -z "$addr_cidr" ] && continue
@@ -3028,7 +2948,6 @@ rip_add_neighbor_safe() {
   tprint "  (the advertising router IP) and is not directly configurable."
   tprint ""
 
-  # FIX-Issue3: Show passive-interface context before the user enters an IP
   rip_neighbor_context_warning
 
   tprint "Current neighbors: ${current[*]:-(none)}"
@@ -3037,7 +2956,6 @@ rip_add_neighbor_safe() {
   ip="$(ask "Neighbor IP (example: 172.16.150.3)" "")"
   [ -z "$ip" ] && return 0
 
-  # FIX-Issue4: use is_in_list for IP comparison, not is_number_in_list
   if ! is_valid_ipv4 "$ip"; then
     tprint "ERROR: Neighbor must be a valid IPv4 address."
     pause
@@ -3051,7 +2969,6 @@ rip_add_neighbor_safe() {
     return 0
   fi
 
-  # FIX-Issue2: Reachability check
   if ! rip_neighbor_reachable_via_rip "$ip"; then
     tprint ""
     tprint "WARNING: Neighbor $ip does not appear to fall within any"
@@ -3064,7 +2981,6 @@ rip_add_neighbor_safe() {
     [ "$cont" != "y" ] && { tprint "Canceled."; pause; return 0; }
   fi
 
-  # FIX-Issue3: Warn if passive-interface default is NOT set
   if ! is_in_list "default" "${passive[@]}"; then
     tprint ""
     tprint "NOTE: passive-interface default is NOT set."
@@ -3103,7 +3019,6 @@ rip_delete_neighbor_existing() {
 
   require_nonempty_list_or_return "RIP neighbors" "${current[@]}" || return 0
 
-  # FIX-Issue3: Warn if deleting the last neighbor while passive-default is set
   if is_in_list "default" "${passive[@]}" && [ "${#current[@]}" -le 1 ]; then
     tprint "WARNING: passive-interface default IS set."
     tprint "Deleting the last neighbor will leave RIP with no way to"
@@ -3132,12 +3047,6 @@ rip_delete_neighbor_existing() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP: Passive interface
-# set protocols rip passive-interface interface <iface|default>
-# On passive interfaces, RIP listens but does NOT send updates.
-# 'default' sets ALL interfaces to passive (use neighbor to whitelist peers).
-# ----------------------------
 rip_add_passive_interface_safe() {
   local current=() ifs=() iface yn
   load_array current scan_rip_passive_interfaces
@@ -3154,7 +3063,6 @@ rip_add_passive_interface_safe() {
   tprint "Current passive interfaces: ${current[*]:-(none)}"
   tprint ""
 
-  # Build choice list: detected ethernet + 'default'
   local choices=("default")
   local i
   for i in "${ifs[@]}"; do
@@ -3221,11 +3129,6 @@ rip_delete_passive_interface_existing() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP: Redistribute
-# set protocols rip redistribute <source> [metric <1-16>]
-# Sources: connected, static, ospf, bgp, kernel
-# ----------------------------
 scan_rip_redistribute_metric() {
   local src="$1"
   get_cfg_cmds \
@@ -3250,7 +3153,6 @@ rip_add_redistribute_safe() {
   tprint "Currently redistributing: ${current[*]:-(none)}"
   tprint ""
 
-  # Filter out already-configured sources
   local available=()
   local s
   for s in "${sources[@]}"; do
@@ -3320,11 +3222,6 @@ rip_delete_redistribute_existing() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP: Default route origination
-# set protocols rip default-information originate
-# Injects a 0.0.0.0/0 default route into RIP.
-# ----------------------------
 rip_default_information_toggle() {
   local yn
   local is_set=0
@@ -3353,12 +3250,6 @@ rip_default_information_toggle() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP: Timers
-# set protocols rip timers update <5-2147483647>    (default 30)
-# set protocols rip timers timeout <5-2147483647>   (default 180)
-# set protocols rip timers garbage-collection <5-2147483647> (default 120)
-# ----------------------------
 is_valid_rip_timer() {
   local v="$1"
   echo "$v" | grep -Eq '^[0-9]+$' || return 1
@@ -3376,7 +3267,6 @@ rip_timers_menu() {
   tprint "Range: 5 to 2147483647"
   tprint ""
 
-  # Show current values
   local cur_update cur_timeout cur_gc
   cur_update="$(get_cfg_cmds | grep -F "set protocols rip timers update " | awk '{print $6}' | head -n 1 | while read -r x; do strip_quotes "$x"; done)"
   cur_timeout="$(get_cfg_cmds | grep -F "set protocols rip timers timeout " | awk '{print $6}' | head -n 1 | while read -r x; do strip_quotes "$x"; done)"
@@ -3456,12 +3346,6 @@ rip_timers_reset() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP: Static route (RIP-only, not kernel)
-# set protocols rip route <A.B.C.D/M>
-# Note: This route exists ONLY in RIP — not installed in the kernel.
-# Use with caution. Prefer 'redistribute static' for normal static routes.
-# ----------------------------
 rip_add_static_route_safe() {
   local current=() net yn
   load_array current scan_rip_static_routes
@@ -3528,13 +3412,6 @@ rip_delete_static_route_existing() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP: Per-interface settings
-# set interfaces ethernet <if> ip rip split-horizon [disable|poison-reverse]
-# set interfaces ethernet <if> ip rip authentication mode [md5|plaintext]
-# set interfaces ethernet <if> ip rip authentication md5 <keyid> password <pw>
-# set interfaces ethernet <if> ip rip authentication plaintext-password <pw>
-# ----------------------------
 rip_iface_settings_menu() {
   local ifs=() iface
   load_array ifs scan_eth_ifaces
@@ -3557,7 +3434,6 @@ rip_iface_settings_menu() {
     return 0
   fi
 
-  # Show current per-interface RIP config for this interface
   tprint ""
   tprint "Current RIP settings for $iface:"
   tprint "--------------------------------------------------------"
@@ -3575,7 +3451,6 @@ rip_iface_settings_menu() {
 
   case "$choice" in
     "split-horizon enable (default)")
-      # Removing the split-horizon disable/poison-reverse restores default
       local yn
       yn="$(choose_yes_no "Remove split-horizon override (restore default split-horizon on)?" "y" || echo "n")"
       [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
@@ -3674,11 +3549,6 @@ rip_iface_settings_menu() {
   esac
 }
 
-# ----------------------------
-# RIP: Default distance
-# set protocols rip default-distance <1-255>
-# Distance 255 = effectively disabled (not installed to kernel).
-# ----------------------------
 rip_set_default_distance() {
   local cur dist yn
 
@@ -3713,9 +3583,6 @@ rip_set_default_distance() {
   cfg_apply
 }
 
-# ----------------------------
-# RIP menu (main)
-# ----------------------------
 rip_show_summary() {
   tprint "Current RIP state:"
   tprint "  interfaces:         $(scan_rip_interfaces | join_lines)"
@@ -3818,8 +3685,6 @@ raw_mode() {
   fi
 
   # FIX-9 note: word-splitting of $cmd here is intentional.
-  # 'set' and 'delete' (the VyOS builtins via my_set/my_delete) require
-  # arguments as separate words. Do NOT quote $cmd.
   # shellcheck disable=SC2086
   set -- $cmd
   local verb="${1:-}"
@@ -3845,6 +3710,475 @@ raw_mode() {
   cfg_apply
 }
 
+# ============================================================
+# Expanded Interfaces Submenu
+# Supports: Ethernet (ethX), Bonding (bondX), VLANs (ethX.Y), Loopback
+# Operations: set/change IP, delete IP, set description,
+#             enable/disable interface, show interface details
+# ============================================================
+
+# ----------------------------
+# Scan helpers for each type
+# ----------------------------
+scan_bond_ifaces() {
+  get_cfg_cmds \
+    | grep -F "set interfaces bonding " \
+    | awk '{print $4}' \
+    | sort -u \
+    | while read -r x; do strip_quotes "$x"; done
+}
+
+scan_vlan_ifaces() {
+  # VLANs: set interfaces ethernet <if> vif <vid>
+  # Returned as ethX.VID for operator readability.
+  get_cfg_cmds \
+    | grep -F " vif " \
+    | grep -F "set interfaces ethernet " \
+    | awk '{print $4 "." $6}' \
+    | sort -u \
+    | while read -r x; do strip_quotes "$x"; done
+}
+
+scan_loopback_ifaces() {
+  get_cfg_cmds \
+    | grep -F "set interfaces loopback " \
+    | awk '{print $4}' \
+    | sort -u \
+    | while read -r x; do strip_quotes "$x"; done
+}
+
+# Unified scanner: all known interface types merged + sorted
+scan_all_ifaces() {
+  {
+    scan_eth_ifaces
+    scan_bond_ifaces
+    scan_vlan_ifaces
+    scan_loopback_ifaces
+  } | sort -u
+}
+
+# ----------------------------
+# Resolve interface type + config path
+# Returns: type|parent|vif
+#   type   = ethernet | bonding | loopback
+#   parent = ethX / bondX / loX
+#   vif    = VLAN ID (empty if not a VLAN)
+# ----------------------------
+resolve_iface_path() {
+  local iface="$1"
+
+  # VLAN: ethX.VID
+  if echo "$iface" | grep -Eq '^eth[0-9]+\.[0-9]+$'; then
+    local parent="${iface%%.*}"
+    local vif="${iface#*.}"
+    echo "ethernet|$parent|$vif"
+    return 0
+  fi
+
+  # Bonding
+  if echo "$iface" | grep -Eq '^bond[0-9]+$'; then
+    echo "bonding|$iface|"
+    return 0
+  fi
+
+  # Loopback
+  if echo "$iface" | grep -Eq '^lo[0-9]*$'; then
+    echo "loopback|$iface|"
+    return 0
+  fi
+
+  # Default: ethernet
+  echo "ethernet|$iface|"
+}
+
+# ----------------------------
+# cfg_set / cfg_delete wrappers that handle VLAN vif paths
+# ----------------------------
+iface_cfg_set() {
+  local iface="$1"; shift
+  local resolved type parent vif
+  resolved="$(resolve_iface_path "$iface")"
+  type="$(echo "$resolved" | cut -d'|' -f1)"
+  parent="$(echo "$resolved" | cut -d'|' -f2)"
+  vif="$(echo "$resolved" | cut -d'|' -f3)"
+
+  if [ -n "$vif" ]; then
+    cfg_set interfaces "$type" "$parent" vif "$vif" "$@"
+  else
+    cfg_set interfaces "$type" "$parent" "$@"
+  fi
+}
+
+iface_cfg_delete() {
+  local iface="$1"; shift
+  local resolved type parent vif
+  resolved="$(resolve_iface_path "$iface")"
+  type="$(echo "$resolved" | cut -d'|' -f1)"
+  parent="$(echo "$resolved" | cut -d'|' -f2)"
+  vif="$(echo "$resolved" | cut -d'|' -f3)"
+
+  if [ -n "$vif" ]; then
+    cfg_delete interfaces "$type" "$parent" vif "$vif" "$@"
+  else
+    cfg_delete interfaces "$type" "$parent" "$@"
+  fi
+}
+
+# ----------------------------
+# Get all IPs configured on an interface
+# ----------------------------
+scan_iface_addresses() {
+  local iface="$1"
+  local resolved type parent vif
+  resolved="$(resolve_iface_path "$iface")"
+  type="$(echo "$resolved" | cut -d'|' -f1)"
+  parent="$(echo "$resolved" | cut -d'|' -f2)"
+  vif="$(echo "$resolved" | cut -d'|' -f3)"
+
+  local pattern
+  if [ -n "$vif" ]; then
+    pattern="set interfaces $type $parent vif $vif address "
+  else
+    pattern="set interfaces $type $parent address "
+  fi
+
+  get_cfg_cmds \
+    | grep -F "$pattern" \
+    | awk '{print $NF}' \
+    | sort -u \
+    | while read -r x; do strip_quotes "$x"; done
+}
+
+# Get current description for an interface
+get_iface_description() {
+  local iface="$1"
+  local resolved type parent vif
+  resolved="$(resolve_iface_path "$iface")"
+  type="$(echo "$resolved" | cut -d'|' -f1)"
+  parent="$(echo "$resolved" | cut -d'|' -f2)"
+  vif="$(echo "$resolved" | cut -d'|' -f3)"
+
+  local pattern
+  if [ -n "$vif" ]; then
+    pattern="set interfaces $type $parent vif $vif description "
+  else
+    pattern="set interfaces $type $parent description "
+  fi
+
+  get_cfg_cmds \
+    | grep -F "$pattern" \
+    | awk '{$1=$2=$3=$4=$5=""; if ($6!="") $6=""; print}' \
+    | sed 's/^[[:space:]]*//' \
+    | head -n 1 \
+    | while read -r x; do strip_quotes "$x"; done
+}
+
+# Check if interface is admin-disabled in config
+iface_is_disabled() {
+  local iface="$1"
+  local resolved type parent vif
+  resolved="$(resolve_iface_path "$iface")"
+  type="$(echo "$resolved" | cut -d'|' -f1)"
+  parent="$(echo "$resolved" | cut -d'|' -f2)"
+  vif="$(echo "$resolved" | cut -d'|' -f3)"
+
+  local pattern
+  if [ -n "$vif" ]; then
+    pattern="set interfaces $type $parent vif $vif disable"
+  else
+    pattern="set interfaces $type $parent disable"
+  fi
+
+  get_cfg_cmds | grep -F -q "$pattern"
+}
+
+# ----------------------------
+# Shared: choose an interface from ALL types
+# ----------------------------
+iface_choose_any() {
+  local label="${1:-Select interface}"
+  local all=()
+  load_array all scan_all_ifaces
+
+  tprint ""
+  tprint "Detected interfaces:"
+  tprint "  Ethernet:  $(scan_eth_ifaces | join_lines)"
+  tprint "  Bonding:   $(scan_bond_ifaces | join_lines)"
+  tprint "  VLANs:     $(scan_vlan_ifaces | join_lines)"
+  tprint "  Loopback:  $(scan_loopback_ifaces | join_lines)"
+  tprint ""
+
+  require_nonempty_list_or_return "Interfaces" "${all[@]}" || return 1
+
+  if select_from_list "$label" "${all[@]}"; then
+    echo "$SELECTED"
+    return 0
+  fi
+  return 1
+}
+
+# ----------------------------
+# Operation: Set / Change IP address
+# ----------------------------
+iface_op_set_ip() {
+  local iface addrs=() new_ip yn
+
+  iface="$(iface_choose_any "Select interface to set IP on")" || return 0
+
+  load_array addrs scan_iface_addresses "$iface"
+
+  tprint ""
+  tprint "You selected: SET / CHANGE IP ADDRESS on $iface"
+  tprint "Current addresses on $iface: ${addrs[*]:-(none)}"
+  tprint ""
+  tprint "Enter the new address in CIDR format (example: 192.168.1.1/24)."
+  tprint "VyOS supports multiple addresses per interface."
+  tprint "To REMOVE an address use: Delete IP address (option 2)."
+  tprint ""
+
+  new_ip="$(ask "New address (CIDR)" "")"
+  [ -z "$new_ip" ] && return 0
+
+  if ! is_valid_cidr4 "$new_ip"; then
+    tprint "ERROR: Address must be IPv4/CIDR like 192.168.1.1/24."
+    pause
+    return 0
+  fi
+
+  if is_in_list "$new_ip" "${addrs[@]}"; then
+    tprint ""
+    tprint "ERROR: $new_ip is already configured on $iface."
+    tprint "Nothing to do."
+    pause
+    return 0
+  fi
+
+  tprint ""
+  tprint "SUMMARY:"
+  tprint "  interface: $iface"
+  tprint "  add address: $new_ip"
+  tprint ""
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+  cfg_begin || return 0
+  iface_cfg_set "$iface" address "$new_ip"
+  cfg_apply
+}
+
+# ----------------------------
+# Operation: Delete an IP address
+# ----------------------------
+iface_op_delete_ip() {
+  local iface addrs=() target yn
+
+  iface="$(iface_choose_any "Select interface to delete IP from")" || return 0
+
+  load_array addrs scan_iface_addresses "$iface"
+
+  tprint ""
+  tprint "You selected: DELETE IP ADDRESS from $iface"
+  tprint ""
+
+  require_nonempty_list_or_return "Addresses on $iface" "${addrs[@]}" || return 0
+
+  if select_from_list "Select address to DELETE from $iface" "${addrs[@]}"; then
+    target="$SELECTED"
+  else
+    return 0
+  fi
+
+  tprint ""
+  tprint "You are about to delete: $target  from  $iface"
+  tprint ""
+  yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+  cfg_begin || return 0
+  iface_cfg_delete "$iface" address "$target"
+  cfg_apply
+}
+
+# ----------------------------
+# Operation: Set description
+# ----------------------------
+iface_op_set_description() {
+  local iface cur_desc new_desc yn
+
+  iface="$(iface_choose_any "Select interface to set description on")" || return 0
+
+  cur_desc="$(get_iface_description "$iface")"
+
+  tprint ""
+  tprint "You selected: SET DESCRIPTION on $iface"
+  tprint "Current description: ${cur_desc:-(none)}"
+  tprint "Leave blank to DELETE the existing description."
+  tprint ""
+
+  new_desc="$(ask "New description (example: WAN-uplink)" "")"
+
+  if [ -n "$new_desc" ] && ! is_safe_free_text "$new_desc"; then
+    tprint "ERROR: Description has unsupported characters (no backticks or pipes)."
+    pause
+    return 0
+  fi
+
+  tprint ""
+  if [ -z "$new_desc" ]; then
+    tprint "SUMMARY: DELETE description on $iface"
+  else
+    tprint "SUMMARY: Set description on $iface to: $new_desc"
+  fi
+  tprint ""
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+  cfg_begin || return 0
+  if [ -z "$new_desc" ]; then
+    iface_cfg_delete "$iface" description
+  else
+    iface_cfg_set "$iface" description "$new_desc"
+  fi
+  cfg_apply
+}
+
+# ----------------------------
+# Operation: Enable / disable interface
+# ----------------------------
+iface_op_enable_disable() {
+  local iface yn
+
+  iface="$(iface_choose_any "Select interface to enable or disable")" || return 0
+
+  tprint ""
+  if iface_is_disabled "$iface"; then
+    tprint "Interface $iface is currently: DISABLED"
+    tprint ""
+    yn="$(choose_yes_no "Enable $iface now?" "y" || echo "n")"
+    [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+    cfg_begin || return 0
+    iface_cfg_delete "$iface" disable
+    cfg_apply
+  else
+    tprint "Interface $iface is currently: ENABLED"
+    tprint ""
+    tprint "WARNING: Disabling a live interface drops all traffic through it."
+    tprint ""
+    yn="$(choose_yes_no "Disable $iface now?" "n" || echo "n")"
+    [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+    cfg_begin || return 0
+    iface_cfg_set "$iface" disable
+    cfg_apply
+  fi
+}
+
+# ----------------------------
+# Operation: Show interface details
+# ----------------------------
+iface_op_show_details() {
+  local iface
+
+  iface="$(iface_choose_any "Select interface to show details for")" || return 0
+
+  tprint ""
+  tprint "=== Details for: $iface ==="
+  tprint ""
+
+  local resolved type parent vif
+  resolved="$(resolve_iface_path "$iface")"
+  type="$(echo "$resolved" | cut -d'|' -f1)"
+  parent="$(echo "$resolved" | cut -d'|' -f2)"
+  vif="$(echo "$resolved" | cut -d'|' -f3)"
+
+  tprint "--- Config (from running config) ---"
+  tprint "--------------------------------------------------------"
+  if [ -n "$vif" ]; then
+    (get_cfg_cmds | grep -F "set interfaces $type $parent vif $vif " || true) >"$TTY"
+    (get_cfg_cmds | grep -F "set interfaces $type '$parent' vif $vif " || true) >>"$TTY"
+  else
+    (get_cfg_cmds | grep -F "set interfaces $type $parent " || true) >"$TTY"
+    (get_cfg_cmds | grep -F "set interfaces $type '$parent' " || true) >>"$TTY"
+  fi
+  tprint "--------------------------------------------------------"
+
+  local addrs disabled_label desc
+  addrs="$(scan_iface_addresses "$iface" | join_lines)"
+  desc="$(get_iface_description "$iface")"
+  if iface_is_disabled "$iface"; then
+    disabled_label="DISABLED"
+  else
+    disabled_label="enabled"
+  fi
+
+  tprint ""
+  tprint "Summary:"
+  tprint "  Type:        $type"
+  tprint "  Addresses:   ${addrs:-(none)}"
+  tprint "  Description: ${desc:-(none)}"
+  tprint "  Admin state: $disabled_label"
+  tprint ""
+
+  tprint "--- Operational state (show interfaces) ---"
+  tprint "--------------------------------------------------------"
+  if ! run show interfaces "$type" "$parent" >"$TTY" 2>&1; then
+    run show interfaces >"$TTY" 2>&1 || true
+  fi
+  tprint "--------------------------------------------------------"
+
+  pause
+}
+
+# ----------------------------
+# Expanded Interfaces Menu
+# ----------------------------
+iface_expanded_show_summary() {
+  tprint "Detected interfaces:"
+  tprint "  Ethernet:  $(scan_eth_ifaces | join_lines)"
+  tprint "  Bonding:   $(scan_bond_ifaces | join_lines)"
+  tprint "  VLANs:     $(scan_vlan_ifaces | join_lines)"
+  tprint "  Loopback:  $(scan_loopback_ifaces | join_lines)"
+  tprint ""
+}
+
+iface_expanded_menu() {
+  # FIX-14: Check config access at submenu entry
+  warn_if_no_access || return 0
+
+  while true; do
+    tprint ""
+    tprint "=================================="
+    tprint " Interfaces — Expanded Submenu"
+    tprint "=================================="
+    iface_expanded_show_summary
+    tprint "Supported types: Ethernet, Bonding, VLAN (ethX.VID), Loopback"
+    tprint ""
+    tprint "SAFE RULES:"
+    tprint "  - Adding an IP will NOT overwrite existing IPs (VyOS allows multiple)."
+    tprint "  - Delete IP selects from a list (no blind removal)."
+    tprint "  - Enable/Disable shows current state before acting."
+    tprint ""
+    tprint "1) Set / add IP address (CIDR)"
+    tprint "2) Delete IP address"
+    tprint "3) Set description"
+    tprint "4) Enable / disable interface"
+    tprint "5) Show interface details"
+    tprint "6) Back"
+    local c
+    tread c "Select menu option #: " || continue
+    case "$c" in
+      1) iface_op_set_ip ;;
+      2) iface_op_delete_ip ;;
+      3) iface_op_set_description ;;
+      4) iface_op_enable_disable ;;
+      5) iface_op_show_details ;;
+      6) return 0 ;;
+      *) tprint "Invalid." ;;
+    esac
+  done
+}
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -3857,15 +4191,16 @@ main_menu() {
     tprint " VyOS Dynamic Menu (Scan + CRUD)"
     tprint "=================================="
     show_detected_summary
-    tprint "1) Interfaces submenu"
-    tprint "2) Firewall submenu"
-    tprint "3) NAT submenu"
-    tprint "4) System submenu (users + hostname)"
-    tprint "5) DNS Forwarding submenu"
-    tprint "6) RIP submenu"
-    tprint "7) Raw mode (restricted set/delete)"
-    tprint "8) Show full config (commands)"
-    tprint "9) Exit"
+    tprint "1)  Interfaces submenu (ethernet, quick)"
+    tprint "2)  Firewall submenu"
+    tprint "3)  NAT submenu"
+    tprint "4)  System submenu (users + hostname)"
+    tprint "5)  DNS Forwarding submenu"
+    tprint "6)  RIP submenu"
+    tprint "7)  Raw mode (restricted set/delete)"
+    tprint "8)  Show full config (commands)"
+    tprint "9)  Interfaces — Expanded (all types, full control)"
+    tprint "10) Exit"
     tprint ""
     local c
     tread c "Select menu option #: " || continue
@@ -3878,7 +4213,8 @@ main_menu() {
       6) rip_menu ;;
       7) raw_mode ;;
       8) tprint ""; get_cfg_cmds >"$TTY"; tprint ""; pause ;;
-      9)
+      9) iface_expanded_menu ;;
+      10)
         cfg_end >/dev/null 2>&1 || true
         builtin exit 0
         ;;

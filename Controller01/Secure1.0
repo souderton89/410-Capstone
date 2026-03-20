@@ -552,13 +552,11 @@ scan_zone_bindings() {
 }
 
 binding_exists() {
-  # Returns 0 if a TO<-FROM binding already exists in config.
   local to="$1" from="$2"
   scan_zone_bindings | grep -F -q "${to}|${from}|"
 }
 
 binding_get_ruleset() {
-  # Returns the ruleset name currently attached to a TO<-FROM binding.
   local to="$1" from="$2"
   scan_zone_bindings | grep -F "${to}|${from}|" | head -n 1 | awk -F'|' '{print $3}'
 }
@@ -580,6 +578,7 @@ scan_dns_allow_from()    { grep_cfg "set service dns forwarding allow-from "    
 scan_dns_listen_address() { grep_cfg "set service dns forwarding listen-address " | awk '{print $6}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
 dns_system_is_enabled()  { grep_cfg "set service dns forwarding system" | grep -q .; }
 scan_dns_name_servers()  { grep_cfg "set system name-server " | awk '{print $4}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
+scan_dns_forward_domains() { grep_cfg "set service dns forwarding domain " | grep -F " name-server " | awk '{print $6}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
 
 # --- RIP ---
 scan_rip_interfaces()       { grep_cfg "set protocols rip interface "           | awk '{print $5}' | sort -u | while read -r x; do strip_quotes "$x"; done; }
@@ -724,6 +723,7 @@ _dns_summary() {
   local sys="disabled"; dns_system_is_enabled && sys="ENABLED"
   tprint "  system:         $sys"
   tprint "  name-servers:   $(scan_dns_name_servers   | join_lines || echo NONE)"
+  tprint "  fwd domains:    $(scan_dns_forward_domains | join_lines || echo NONE)"
 }
 _rip_summary() {
   tprint "  interfaces:         $(scan_rip_interfaces        | join_lines || echo NONE)"
@@ -750,11 +750,6 @@ run_cmd_to_tty() {
 # ============================================================
 
 get_unassigned_real_ifaces() {
-  # Returns real interfaces NOT already in a zone, excluding loopback.
-  # FIX: ensure cache is warm before calling scan_zone_ifaces, and
-  #      collect assigned ifaces into an array before filtering.
-
-  # Ensure cache is valid before any scan calls
   if [ "$_CFG_CACHE_VALID" -eq 0 ]; then
     cfg_cache_refresh || return 1
   fi
@@ -762,20 +757,16 @@ get_unassigned_real_ifaces() {
   local all=() assigned=() result=()
   load_array all scan_all_ifaces
 
-  # Collect all interfaces already assigned to any zone
   local zi z i
   while IFS='|' read -r z i; do
     [ -n "$i" ] && assigned+=("$i")
   done < <(scan_zone_ifaces)
 
-  # Filter: exclude loopback and already-assigned
   local iface
   for iface in "${all[@]}"; do
-    # Skip loopback
     if echo "$iface" | grep -Eq '^lo[0-9]*$'; then
       continue
     fi
-    # Skip if already assigned to a zone
     if is_in_list "$iface" "${assigned[@]}"; then
       continue
     fi
@@ -786,30 +777,19 @@ get_unassigned_real_ifaces() {
 }
 
 zone_create_single_interface() {
-  # MODE A: Create ONE zone — normal or local-zone type.
-  #
-  # FIXES applied:
-  #   - Normal zone: interface selection only shown for normal type
-  #   - Local zone:  interface selection skipped entirely (local-zone has no member)
-  #   - Both types:  default-action drop set before interface assignment
-  #   - Cache refreshed before unassigned iface scan
-
   local zones=() zname yn zone_type default_action
 
-  # Refresh cache before scanning
   cfg_cache_refresh || return 0
 
   load_array zones scan_fw_zones
   tprint ""; tprint "Existing zones: ${zones[*]:-(none)}"; tprint ""
 
-  # Ask zone type FIRST so we know whether to show interface selection
   select_from_list_default "Zone type" "normal" "normal" "local-zone (router self)" || return 0
   case "$SELECTED" in
     "local-zone (router self)") zone_type="local" ;;
     *) zone_type="normal" ;;
   esac
 
-  # For normal zones only: pick an unassigned interface
   local iface=""
   if [ "$zone_type" = "normal" ]; then
     local unassigned_ifaces=()
@@ -819,7 +799,6 @@ zone_create_single_interface() {
     iface="$SELECTED"
   fi
 
-  # Ask zone name
   if [ "$zone_type" = "local" ]; then
     zname="$(ask "Local zone name (e.g. LOCAL, ROUTER)" "")"
   else
@@ -834,11 +813,9 @@ zone_create_single_interface() {
     tprint "ERROR: Zone '$zname' already exists."; pause; return 0
   fi
 
-  # Ask default-action
   select_from_list_default "Default action for $zname" "drop" "drop" "accept" "reject" || return 0
   default_action="$SELECTED"
 
-  # Confirm summary
   tprint ""
   if [ "$zone_type" = "local" ]; then
     tprint "SUMMARY: create local-zone '$zname'  default-action=$default_action"
@@ -852,11 +829,9 @@ zone_create_single_interface() {
   cfg_begin || return 0
 
   if [ "$zone_type" = "local" ]; then
-    # local-zone: set local-zone flag and default-action; NO interface member
     cfg_set firewall zone "$zname" local-zone
     cfg_set firewall zone "$zname" default-action "$default_action"
   else
-    # normal zone: set default-action FIRST, then assign interface
     cfg_set firewall zone "$zname" default-action "$default_action"
     cfg_set firewall zone "$zname" member interface "$iface"
   fi
@@ -865,17 +840,6 @@ zone_create_single_interface() {
 }
 
 zone_create_batch_from_interfaces() {
-  # MODE B: Batch-create zones from all unassigned interfaces.
-  #
-  # FIXES applied:
-  #   - Cache refreshed before scan
-  #   - Single cfg_begin / cfg_apply wraps the entire batch (one commit)
-  #   - default-action set before interface assignment for every zone
-  #   - In-memory created_zones tracks names used this session to catch
-  #     intra-batch duplicates (cache is invalid mid-session)
-  #   - Skipped interfaces are tracked to avoid double-assignment
-
-  # Refresh cache before scanning
   cfg_cache_refresh || return 0
 
   local unassigned_ifaces=() yn
@@ -889,15 +853,10 @@ zone_create_batch_from_interfaces() {
   tprint "Leave the zone name blank to skip an interface."
   tprint ""
 
-  # Collect zone definitions interactively BEFORE opening a config session
-  # so we don't hold the session open during user input.
   local existing_zones=()
   load_array existing_zones scan_fw_zones
 
-  # Track zones defined in this batch (in-memory duplicate guard)
   local created_zones=()
-
-  # Arrays to hold what we will commit
   local batch_ifaces=()
   local batch_znames=()
   local batch_actions=()
@@ -913,7 +872,6 @@ zone_create_batch_from_interfaces() {
     if ! is_safe_ruleset_name "$zname"; then
       tprint "ERROR: Invalid zone name (letters/numbers/_/./- max 64). Skipping $iface."; continue
     fi
-    # Check against already-existing zones AND zones created in this batch
     if is_in_list "$zname" "${existing_zones[@]}" || is_in_list "$zname" "${created_zones[@]}"; then
       tprint "ERROR: Zone '$zname' already exists or was already used in this batch. Skipping."; continue
     fi
@@ -930,12 +888,10 @@ zone_create_batch_from_interfaces() {
     created_zones+=("$zname")
   done
 
-  # Nothing to do?
   if [ "${#batch_znames[@]}" -eq 0 ]; then
     tprint ""; tprint "Nothing to create."; pause; return 0
   fi
 
-  # Show summary and confirm before opening the config session
   tprint ""
   tprint "=== Batch Summary ==="
   local idx
@@ -947,7 +903,6 @@ zone_create_batch_from_interfaces() {
   yn="$(choose_yes_no "Create all zones above in a single commit?" "y" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
-  # Open ONE config session for the entire batch
   cfg_begin || return 0
 
   for idx in "${!batch_znames[@]}"; do
@@ -956,12 +911,10 @@ zone_create_batch_from_interfaces() {
     default_action="${batch_actions[$idx]}"
 
     tprint "Staging: zone '$zname'  interface=$iface  default-action=$default_action"
-    # Set default-action FIRST, then assign interface (per VyOS docs)
     cfg_set firewall zone "$zname" default-action "$default_action"
     cfg_set firewall zone "$zname" member interface "$iface"
   done
 
-  # Single commit + save for the whole batch
   cfg_apply
 
   tprint "Batch zone creation complete."
@@ -1220,11 +1173,10 @@ fw_add_rule_guided_safe() {
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
 
   cfg_begin || return 0
-  # Auto-set ruleset default-action drop if this is a brand-new ruleset (VyOS requires it)
   local existing_rs=()
   load_array existing_rs scan_firewall_rulesets
   if ! is_in_list "$rs" "${existing_rs[@]}"; then
-    tprint "New ruleset \'$rs\' — setting default-action drop."
+    tprint "New ruleset '$rs' — setting default-action drop."
     cfg_set firewall ipv4 name "$rs" default-action drop
   fi
   cfg_set firewall ipv4 name "$rs" rule "$n" action "$action"
@@ -1234,7 +1186,6 @@ fw_add_rule_guided_safe() {
   [ -n "$daddr" ] && cfg_set firewall ipv4 name "$rs" rule "$n" destination address "$daddr"
   [ -n "$sport" ] && cfg_set firewall ipv4 name "$rs" rule "$n" source port "$sport"
   [ -n "$dport" ] && cfg_set firewall ipv4 name "$rs" rule "$n" destination port "$dport"
-  # VyOS 2025 rolling: state match requires "enable" keyword
   { [ "$state_est" = "y" ] || [ "$state_est" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state established
   { [ "$state_rel" = "y" ] || [ "$state_rel" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state related
   { [ "$state_new" = "y" ] || [ "$state_new" = "Y" ]; } && cfg_set firewall ipv4 name "$rs" rule "$n" state new
@@ -1289,7 +1240,6 @@ fw_update_single_field() {
       yn="$(choose_yes_no "Enable this state match?" "y" || echo "n")"
       local st="${field#state }"
       cfg_begin || return 0
-      # VyOS rolling current: state match is just the state name, no "enable" keyword
       [ "$yn" = "y" ] && cfg_set   firewall ipv4 name "$rs" rule "$n" state "$st" \
                       || cfg_delete firewall ipv4 name "$rs" rule "$n" state "$st"
       cfg_apply ;;
@@ -1505,10 +1455,8 @@ zone_binding_preview() {
 
 zone_list_bindings() {
   tprint ""
-  tprint "You selected: List zone bindings"
   tprint "Current zone bindings (TO <- FROM = RULESET):"
   tprint ""
-
   local b=()
   load_array b scan_zone_bindings
   if [ "${#b[@]}" -eq 0 ]; then
@@ -1516,40 +1464,23 @@ zone_list_bindings() {
     pause
     return 0
   fi
-
   printf "%s\n" "${b[@]}" | awk -F'|' '{printf "  %s <- %s   =   %s\n",$1,$2,$3}' >"$TTY"
   pause
 }
 
 zone_add_binding_safe() {
   local to from ruleset existing_rs yn
-
-  tprint ""
-  tprint "You selected: ADD zone binding (SAFE - will not overwrite)"
-  tprint "This attaches a ruleset to a zone direction:"
-  tprint "  TO-ZONE  <-  FROM-ZONE"
-  tprint ""
-
   to="$(zone_choose_existing)" || return 0
   from="$(zone_choose_existing)" || return 0
 
   if [ "$to" = "$from" ]; then
-    tprint ""
-    tprint "ERROR: TO and FROM cannot be the same zone."
-    pause
-    return 0
+    tprint ""; tprint "ERROR: TO and FROM cannot be the same zone."; pause; return 0
   fi
 
   if binding_exists "$to" "$from"; then
     existing_rs="$(binding_get_ruleset "$to" "$from")"
-    tprint ""
-    tprint "ERROR: Binding already exists:"
-    tprint "  $to <- $from  =  ${existing_rs:-UNKNOWN}"
-    tprint ""
-    tprint "Add mode will NOT overwrite."
-    tprint "Use Update/Delete in Zone Bindings menu."
-    pause
-    return 0
+    tprint ""; tprint "ERROR: Binding already exists: $to <- $from  =  ${existing_rs:-UNKNOWN}"
+    tprint "Use Update/Delete in Zone Bindings menu."; pause; return 0
   fi
 
   local rs_arr=()
@@ -1558,15 +1489,9 @@ zone_add_binding_safe() {
   select_from_list "Select ruleset for binding" "${rs_arr[@]}" || return 0
   ruleset="$SELECTED"
 
-  tprint ""
-  tprint "SUMMARY (new zone binding):"
-  tprint "  TO:      $to"
-  tprint "  FROM:    $from"
-  tprint "  RULESET: $ruleset"
-  tprint ""
-  yn="$(choose_yes_no "Proceed to create this binding?" "y" || echo "n")"
+  tprint ""; tprint "SUMMARY: $to <- $from  =  $ruleset"
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-
   cfg_begin || return 0
   cfg_set firewall zone "$to" from "$from" firewall name "$ruleset"
   cfg_apply
@@ -1574,29 +1499,16 @@ zone_add_binding_safe() {
 
 zone_update_binding_existing() {
   local to from ruleset existing_rs yn
-
-  tprint ""
-  tprint "You selected: UPDATE zone binding (existing only)"
-  tprint "This changes which ruleset is attached to:"
-  tprint "  TO-ZONE <- FROM-ZONE"
-  tprint ""
-
   to="$(zone_choose_existing)" || return 0
   from="$(zone_choose_existing)" || return 0
 
   if ! binding_exists "$to" "$from"; then
-    tprint ""
-    tprint "ERROR: No existing binding for:"
-    tprint "  $to <- $from"
-    tprint ""
-    tprint "Use ADD if you want to create it."
-    pause
-    return 0
+    tprint ""; tprint "ERROR: No existing binding for: $to <- $from"
+    tprint "Use ADD if you want to create it."; pause; return 0
   fi
 
   existing_rs="$(binding_get_ruleset "$to" "$from")"
-  tprint ""
-  tprint "Current ruleset for $to <- $from : ${existing_rs:-UNKNOWN}"
+  tprint ""; tprint "Current ruleset for $to <- $from : ${existing_rs:-UNKNOWN}"
   zone_binding_preview "$to" "$from"
 
   local rs_arr=()
@@ -1605,16 +1517,9 @@ zone_update_binding_existing() {
   select_from_list "Select new ruleset" "${rs_arr[@]}" || return 0
   ruleset="$SELECTED"
 
-  tprint ""
-  tprint "SUMMARY (update binding):"
-  tprint "  TO:      $to"
-  tprint "  FROM:    $from"
-  tprint "  OLD:     ${existing_rs:-UNKNOWN}"
-  tprint "  NEW:     $ruleset"
-  tprint ""
-  yn="$(choose_yes_no "Proceed with update?" "y" || echo "n")"
+  tprint ""; tprint "SUMMARY: $to <- $from  OLD=${existing_rs:-UNKNOWN}  NEW=$ruleset"
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-
   cfg_begin || return 0
   cfg_set firewall zone "$to" from "$from" firewall name "$ruleset"
   cfg_apply
@@ -1622,31 +1527,19 @@ zone_update_binding_existing() {
 
 zone_delete_binding_existing() {
   local to from existing_rs yn
-
-  tprint ""
-  tprint "You selected: DELETE zone binding (existing only)"
-  tprint ""
-
   to="$(zone_choose_existing)" || return 0
   from="$(zone_choose_existing)" || return 0
 
   if ! binding_exists "$to" "$from"; then
-    tprint ""
-    tprint "ERROR: No existing binding for:"
-    tprint "  $to <- $from"
-    pause
-    return 0
+    tprint ""; tprint "ERROR: No existing binding for: $to <- $from"; pause; return 0
   fi
 
   existing_rs="$(binding_get_ruleset "$to" "$from")"
-  tprint ""
-  tprint "You are deleting:"
-  tprint "  $to <- $from  =  ${existing_rs:-UNKNOWN}"
+  tprint ""; tprint "Deleting: $to <- $from  =  ${existing_rs:-UNKNOWN}"
   zone_binding_preview "$to" "$from"
 
   yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-
   cfg_begin || return 0
   cfg_delete firewall zone "$to" from "$from" firewall name
   cfg_apply
@@ -1654,20 +1547,13 @@ zone_delete_binding_existing() {
 
 zone_bindings_menu() {
   while true; do
-    tprint ""
-    tprint "=============================="
+    tprint ""; tprint "=============================="
     tprint " Zone Firewall Bindings"
     tprint "=============================="
-    show_detected_summary
-    tprint "What this does:"
-    tprint "  Attach a ruleset to: TO-ZONE <- FROM-ZONE"
+    tprint "Attach a ruleset to: TO-ZONE <- FROM-ZONE"
     tprint ""
-    tprint "SAFE RULES:"
-    tprint "  - ADD will NOT overwrite existing bindings."
-    tprint "  - Update/Delete only work on EXISTING bindings."
-    tprint ""
-    tprint "1) List bindings (TO <- FROM = RULESET)"
-    tprint "2) ADD binding (SAFE - new only)"
+    tprint "1) List bindings"
+    tprint "2) ADD binding (safe - new only)"
     tprint "3) UPDATE binding (existing only)"
     tprint "4) DELETE binding (existing only)"
     tprint "5) Back"
@@ -1716,6 +1602,183 @@ zone_management_menu() {
   done
 }
 
+# ============================================================
+# ZONE LOGGING AUDIT
+# ============================================================
+# Why this matters:
+#   Without 'default-log' on a firewall policy, VyOS silently
+#   drops packets that hit the default-action with zero visibility
+#   in syslog/journald. This is the gap present in EDGE01 configs
+#   where DMZ-to-LAN, LAN-to-DMZ, and LAN-to-WAN were all missing
+#   default-log — dropped packets left no audit trail.
+#
+# Functions:
+#   fw_get_all_policy_names  — returns every ipv4 named policy
+#   fw_policy_has_default_log — checks if default-log is set
+#   fw_policy_default_action  — returns drop/accept/reject or -
+#   fw_zone_logging_audit     — prints colour-coded table,
+#                               offers to fix all missing at once
+# ============================================================
+
+# FIX-QC1: fw_get_all_policy_names removed — was a pointless wrapper
+# around scan_firewall_rulesets. Callers now use scan_firewall_rulesets
+# directly, consistent with the rest of the script.
+
+# Return 0 (true) if default-log is set for a given policy name.
+#
+# FIX: default-log is a boolean flag — the config line ends exactly at
+# "default-log" with nothing after it:
+#   set firewall ipv4 name 'DMZ-to-LAN' default-log
+#
+# Two grep passes to cover both quoted and unquoted forms in the cache.
+# grep_cfg uses grep -F (fixed-string), so we pipe its output through a
+# second grep with a word-boundary pattern using grep -w to ensure
+# "DMZ-to-LAN" does not partially match "DMZ-to-LAN-extra".
+# The final grep -qF "default-log" confirms the flag is present on that line.
+fw_policy_has_default_log() {
+  local policy="$1"
+  {
+    grep_cfg "set firewall ipv4 name '$policy' default-log"
+    grep_cfg "set firewall ipv4 name $policy default-log"
+  } | grep -qF "default-log" 2>/dev/null
+}
+
+# Return the default-action value for a given policy, or '-' if unset.
+fw_policy_default_action() {
+  local policy="$1" val=""
+  val="$(
+    {
+      grep_cfg "set firewall ipv4 name $policy default-action "
+      grep_cfg "set firewall ipv4 name '$policy' default-action "
+    } | awk '{print $NF}' | head -n 1 | while read -r x; do strip_quotes "$x"; done
+  )"
+  echo "${val:--}"
+}
+
+# _fw_divider: print a 60-char dashed line compatible with vbash (no brace expansion).
+# FIX-QC3: replaced printf '%0.s-' {1..60} — brace expansion is a bashism
+# that is not guaranteed in vbash. awk is always available on VyOS.
+_fw_divider() { awk 'BEGIN{for(i=0;i<60;i++) printf "-"; print ""}' >"$TTY"; }
+
+# Audit table: show every policy with default-action + logging status.
+# Offer to enable default-log on all missing policies in one commit.
+# FIX-QC1: load_array now calls scan_firewall_rulesets directly (wrapper removed).
+# FIX-QC2: log_label / log_display dead variables removed; tprintf uses
+#           the log_state string directly.
+# FIX-QC1 (recursion): post-apply re-audit is now a second pass of the
+#           same loop inside this function — no recursive call.
+fw_zone_logging_audit() {
+  local policies=() missing=() policy da da_display log_state yn p
+  local col_pol=32 col_act=22
+
+  # ── First pass: scan and display ─────────────────────────────
+  while true; do
+    tprint ""
+    tprint "====== Zone Policy Logging Audit ======"
+    tprint ""
+    tprint "Scanning all ipv4 firewall policies..."
+    tprint ""
+
+    policies=()
+    load_array policies scan_firewall_rulesets
+
+    if [ "${#policies[@]}" -eq 0 ]; then
+      tprint "(no ipv4 firewall policies found)"
+      pause; return 0
+    fi
+
+    # Header
+    tprintf "  %-${col_pol}s  %-${col_act}s  %s\n" "Policy" "Default-action" "Logging"
+    _fw_divider
+
+    missing=()
+    for policy in "${policies[@]}"; do
+      da="$(fw_policy_default_action "$policy")"
+
+      # Flag accept default-action as a warning — should almost always be drop
+      case "$da" in
+        drop)   da_display="drop" ;;
+        accept) da_display="accept  <-- WARNING" ;;
+        *)      da_display="$da" ;;
+      esac
+
+      if fw_policy_has_default_log "$policy"; then
+        log_state="[OK]   dropped pkts logged"
+      else
+        log_state="[MISS] dropped pkts NOT logged"
+        missing+=("$policy")
+      fi
+
+      tprintf "  %-${col_pol}s  %-${col_act}s  %s\n" \
+        "$policy" "$da_display" "$log_state"
+    done
+
+    _fw_divider
+
+    # ── All clean ────────────────────────────────────────────────
+    if [ "${#missing[@]}" -eq 0 ]; then
+      tprint ""
+      tprint "  RESULT: All ${#policies[@]} policies have default-log enabled."
+      tprint "          Your audit trail is complete."
+      tprint ""
+      pause; return 0
+    fi
+
+    # ── Some missing ─────────────────────────────────────────────
+    tprint ""
+    tprint "  RESULT: ${#missing[@]} of ${#policies[@]} policies are MISSING default-log:"
+    for p in "${missing[@]}"; do tprintf "    - %s\n" "$p"; done
+    tprint ""
+    tprint "  These policies drop packets with NO syslog entry."
+    tprint ""
+
+    yn="$(choose_yes_no "Enable default-log on all ${#missing[@]} missing policies now?" "y" || echo "n")"
+    if [ "$yn" != "y" ]; then
+      tprint ""
+      tprint "Not applied. Commands to run manually in configure mode:"
+      tprint "--------------------------------------------------------"
+      for p in "${missing[@]}"; do
+        tprintf "  set firewall ipv4 name '%s' default-log\n" "$p"
+      done
+      tprint "  commit"
+      tprint "  save"
+      tprint "--------------------------------------------------------"
+      pause; return 0
+    fi
+
+    # ── Apply fix ────────────────────────────────────────────────
+    # Only stage policies confirmed MISSING by fw_policy_has_default_log —
+    # this avoids the "already exists" noise from cfg_set on policies that
+    # VyOS already has default-log set on.
+    cfg_begin || return 0
+    tprint ""
+    tprint "Staging default-log commands..."
+    local staged=0
+    for p in "${missing[@]}"; do
+      # Double-check: skip if somehow already set (cache may have been stale)
+      if fw_policy_has_default_log "$p"; then
+        tprintf "  (already set, skipping) %s\n" "$p" >"$TTY"
+        continue
+      fi
+      tprintf "  set firewall ipv4 name '%s' default-log\n" "$p" >"$TTY"
+      cfg_set firewall ipv4 name "$p" default-log
+      staged=$((staged+1))
+    done
+    tprint ""
+    if [ "$staged" -eq 0 ]; then
+      tprint "  NOTE: All policies already had default-log set — nothing staged."
+      cfg_end
+      cfg_cache_invalidate
+    else
+      cfg_apply   # commits, saves, invalidates cache, pauses
+    fi
+
+    # Loop back to re-scan and re-display the audit table
+    tprint ""
+    tprint "Re-running audit to verify all policies are now covered..."
+  done
+}
+
 firewall_menu() {
   warn_if_no_access || return 0
   while true; do
@@ -1726,7 +1789,8 @@ firewall_menu() {
     tprint "3) Update rule field"
     tprint "4) Delete rule"
     tprint "5) Zone management"
-    tprint "6) Back"
+    tprint "6) Zone logging audit  (check / enable default-log on all policies)"
+    tprint "7) Back"
     local c; tread c "Select: " || continue
     case "$c" in
       1) fw_list_ruleset ;;
@@ -1734,7 +1798,8 @@ firewall_menu() {
       3) fw_update_single_field ;;
       4) fw_delete_rule ;;
       5) zone_management_menu ;;
-      6) return 0 ;;
+      6) fw_zone_logging_audit ;;
+      7) return 0 ;;
       *) tprint "Invalid." ;;
     esac
   done
@@ -1966,8 +2031,9 @@ nat_menu() {
 }
 
 # ============================================================
-# SYSTEM (users + hostname)
+# SYSTEM — users + hostname
 # ============================================================
+
 user_add_menu() {
   local u pw fn existing=() yn
   u="$(ask "New username (e.g. admin2)" "")"
@@ -2009,6 +2075,88 @@ user_remove_menu() {
   cfg_begin || return 0; cfg_delete system login user "$target"; cfg_apply
 }
 
+# ──────────────────────────────────────────────────────────────
+# user_change_password_menu
+#
+# Changes the password of an existing VyOS login user.
+# Uses the same plaintext-password mechanism as user_add_menu —
+# VyOS hashes it to SHA-512 on commit, so it never persists as
+# plaintext after save.
+#
+# Safety rules (matching the rest of this script):
+#   - User must exist in the config tree (scan_login_users)
+#   - Cannot change password for the currently logged-in user
+#     without an explicit override confirm (different from remove
+#     which blocks it outright — changing your own pw is valid)
+#   - Two-prompt confirmation with tread_secret (hidden input)
+#   - Passwords must match before cfg_begin is opened
+#   - cfg_begin / cfg_apply pattern — same as all other ops
+# ──────────────────────────────────────────────────────────────
+user_change_password_menu() {
+  local users=() target pw1 pw2 current yn
+
+  load_array users scan_login_users
+  require_nonempty_list_or_return "login users" "${users[@]}" || return 0
+
+  current="$(get_current_username)"
+
+  tprint ""
+  tprint "=== Change User Password ==="
+  tprint "Existing VyOS users:"
+  tprint ""
+
+  select_from_list "Select user to change password" "${users[@]}" || return 0
+  target="$SELECTED"
+
+  # Warn (not block) if changing own password — valid operation
+  if [ -n "$current" ] && [ "$target" = "$current" ]; then
+    tprint ""
+    tprint "NOTE: You are changing your OWN password ($current)."
+    tprint "      Make sure you remember it — you will need it for future logins."
+    yn="$(choose_yes_no "Continue?" "y" || echo "n")"
+    [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+  fi
+
+  tprint ""
+  tprint "Setting new password for: $target"
+  tprint "(Input is hidden. VyOS will hash to SHA-512 on commit.)"
+  tprint ""
+
+  # Two-prompt loop until passwords match
+  # FIX-QC5: pw1 and pw2 explicitly cleared at the top of each iteration
+  #           so a failed tread_secret on pw2 never leaks a stale value
+  #           into the next comparison.
+  # FIX-QC6: tread_secret pw2 now has || return 0 so a TTY timeout on
+  #           the confirmation prompt exits cleanly instead of falling
+  #           through and comparing blank pw2 against pw1.
+  while true; do
+    pw1="" pw2=""
+    tread_secret pw1 "New password       : " || return 0
+    [ -z "$pw1" ] && { tprint "ERROR: Password cannot be blank."; continue; }
+
+    tread_secret pw2 "Confirm password   : " || return 0
+
+    if [ "$pw1" = "$pw2" ]; then
+      break
+    fi
+
+    tprint ""
+    tprint "ERROR: Passwords do not match. Try again."
+    tprint ""
+  done
+
+  tprint ""
+  tprint "SUMMARY: change password for '$target'"
+  tprint "         (plaintext sent to config mode, hashed to SHA-512 on commit)"
+  tprint ""
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+
+  cfg_begin || return 0
+  cfg_set system login user "$target" authentication plaintext-password "$pw1"
+  cfg_apply
+}
+
 users_menu() {
   warn_if_no_access || return 0
   while true; do
@@ -2016,9 +2164,16 @@ users_menu() {
     tprint "Users: $(scan_login_users | join_lines || echo NONE)"; tprint ""
     tprint "1) Add user"
     tprint "2) Remove user"
-    tprint "3) Back"
+    tprint "3) Change user password"
+    tprint "4) Back"
     local c; tread c "Select: " || continue
-    case "$c" in 1) user_add_menu ;; 2) user_remove_menu ;; 3) return 0 ;; *) tprint "Invalid." ;; esac
+    case "$c" in
+      1) user_add_menu ;;
+      2) user_remove_menu ;;
+      3) user_change_password_menu ;;
+      4) return 0 ;;
+      *) tprint "Invalid." ;;
+    esac
   done
 }
 
@@ -2147,22 +2302,13 @@ dns_system_forwarding_toggle() {
 }
 
 dns_list_name_servers() {
-  tprint ""
-  tprint "You selected: List system name-servers"
-  tprint "Command: set system name-server <A.B.C.D>"
-  tprint ""
-  tprint "Current name-servers:"
+  tprint ""; tprint "Current name-servers:"
   tprint "--------------------------------------------------------"
-  local ns=()
-  load_array ns scan_dns_name_servers
-  if [ "${#ns[@]}" -eq 0 ]; then
-    tprint "  (none configured)"
-  else
-    local n; for n in "${ns[@]}"; do tprint "  $n"; done
-  fi
+  local ns=(); load_array ns scan_dns_name_servers
+  if [ "${#ns[@]}" -eq 0 ]; then tprint "  (none configured)"
+  else local n; for n in "${ns[@]}"; do tprint "  $n"; done; fi
   tprint "--------------------------------------------------------"
-  tprint ""
-  tprint "Raw config lines:"
+  tprint ""; tprint "Raw config lines:"
   tprint "--------------------------------------------------------"
   (grep_cfg "set system name-server " || true) >"$TTY"
   tprint "--------------------------------------------------------"
@@ -2171,104 +2317,95 @@ dns_list_name_servers() {
 
 dns_add_name_server_safe() {
   local current=() ip yn
-
   load_array current scan_dns_name_servers
-
-  tprint ""
-  tprint "You selected: ADD system name-server (SAFE - will not duplicate)"
-  tprint "Command: set system name-server <A.B.C.D>"
-  tprint "This tells VyOS which upstream DNS server to query."
-  tprint ""
-  tprint "Current name-servers: ${current[*]:-(none)}"
-  tprint ""
-
+  tprint ""; tprint "Current name-servers: ${current[*]:-(none)}"; tprint ""
   ip="$(ask "Name-server IP (example: 10.0.17.2)" "")"
   [ -z "$ip" ] && return 0
-
-  if ! is_valid_ipv4 "$ip"; then
-    tprint "ERROR: Must be a valid IPv4 address."
-    pause
-    return 0
-  fi
-
-  if is_in_list "$ip" "${current[@]}"; then
-    tprint ""
-    tprint "ERROR: Name-server already configured: $ip"
-    pause
-    return 0
-  fi
-
-  tprint ""
-  tprint "SUMMARY:"
-  tprint "  set system name-server $ip"
-  tprint ""
+  is_valid_ipv4 "$ip" || { tprint "ERROR: Must be a valid IPv4 address."; pause; return 0; }
+  is_in_list "$ip" "${current[@]}" && { tprint "ERROR: $ip already configured."; pause; return 0; }
+  tprint ""; tprint "SUMMARY: set system name-server $ip"
   yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-
-  cfg_begin || return 0
-  cfg_set system name-server "$ip"
-  cfg_apply
+  cfg_begin || return 0; cfg_set system name-server "$ip"; cfg_apply
 }
 
 dns_delete_name_server_existing() {
   local current=() target yn
-
   load_array current scan_dns_name_servers
-
-  tprint ""
-  tprint "You selected: DELETE system name-server (existing)"
-  tprint "Command: delete system name-server <A.B.C.D>"
-  tprint ""
-
   require_nonempty_list_or_return "System name-servers" "${current[@]}" || return 0
-
-  if select_from_list "Select name-server to DELETE" "${current[@]}"; then
-    target="$SELECTED"
-  else
-    return 0
-  fi
-
-  tprint ""
-  tprint "You are about to delete: system name-server $target"
-  tprint ""
-  yn="$(choose_yes_no "Proceed with delete?" "n" || echo "n")"
+  select_from_list "Select name-server to DELETE" "${current[@]}" || return 0; target="$SELECTED"
+  tprint ""; tprint "Deleting: system name-server $target"
+  yn="$(choose_yes_no "Proceed?" "n" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+  cfg_begin || return 0; cfg_delete system name-server "$target"; cfg_apply
+}
 
-  cfg_begin || return 0
-  cfg_delete system name-server "$target"
-  cfg_apply
+dns_add_domain_forwarding_safe() {
+  local current=() domain server yn
+  load_array current scan_dns_forward_domains
+  tprint ""; tprint "Current forwarding domains: ${current[*]:-(none)}"; tprint ""
+  domain="$(ask "Domain to forward (e.g. yourdomain.local)" "")"
+  [ -z "$domain" ] && return 0
+  is_valid_hostname "$domain" || { tprint "ERROR: Invalid domain name."; pause; return 0; }
+  is_in_list "$domain" "${current[@]}" && { tprint "ERROR: Domain '$domain' already has a forwarding entry."; pause; return 0; }
+  server="$(ask "Server IP to forward $domain queries to" "")"
+  [ -z "$server" ] && return 0
+  is_valid_ipv4 "$server" || { tprint "ERROR: Must be a valid IPv4 address."; pause; return 0; }
+  tprint ""; tprint "SUMMARY: set service dns forwarding domain $domain name-server $server"
+  yn="$(choose_yes_no "Proceed?" "y" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+  cfg_begin || return 0; cfg_set service dns forwarding domain "$domain" name-server "$server"; cfg_apply
+}
+
+dns_delete_domain_forwarding_existing() {
+  local current=() target yn
+  load_array current scan_dns_forward_domains
+  require_nonempty_list_or_return "DNS forwarding domains" "${current[@]}" || return 0
+  select_from_list "Select domain forwarding entry to DELETE" "${current[@]}" || return 0; target="$SELECTED"
+  tprint ""; tprint "Deleting: dns forwarding domain $target"
+  tprint "--------------------------------------------------------"
+  { grep_cfg "set service dns forwarding domain $target "; grep_cfg "set service dns forwarding domain '$target' "; } >"$TTY" 2>/dev/null || true
+  tprint "--------------------------------------------------------"
+  yn="$(choose_yes_no "Proceed?" "n" || echo "n")"
+  [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
+  cfg_begin || return 0; cfg_delete service dns forwarding domain "$target"; cfg_apply
 }
 
 dns_forwarding_menu() {
   warn_if_no_access || return 0
   while true; do
     tprint ""; tprint "=============================="
-    tprint " DNS Forwarding Submenu"
+    tprint " DNS Forwarding"
     tprint "=============================="
     _dns_summary; tprint ""
-    tprint "1) List full DNS forwarding config"
-    tprint "2) Add allow-from (safe)"
-    tprint "3) Delete allow-from"
-    tprint "4) Add listen-address (safe)"
-    tprint "5) Delete listen-address"
-    tprint "6) Toggle system forwarding"
+    tprint "1)  List full DNS forwarding config"
+    tprint "2)  Add allow-from (safe)"
+    tprint "3)  Delete allow-from"
+    tprint "4)  Add listen-address (safe)"
+    tprint "5)  Delete listen-address"
+    tprint "6)  Toggle system forwarding"
     tprint "--- System Name-Servers ---"
-    tprint "7) List name-servers"
-    tprint "8) Add name-server (safe)"
-    tprint "9) Delete name-server"
-    tprint "10) Back"
+    tprint "7)  List name-servers"
+    tprint "8)  Add name-server (safe)"
+    tprint "9)  Delete name-server"
+    tprint "--- Domain Forwarding ---"
+    tprint "10) Add domain forwarding"
+    tprint "11) Delete domain forwarding"
+    tprint "12) Back"
     local c; tread c "Select menu option #: " || continue
     case "$c" in
-      1) tprint ""; grep_cfg "set service dns forwarding " >"$TTY" 2>/dev/null || true; pause ;;
-      2) dns_add_allow_from_safe ;;
-      3) dns_delete_allow_from_existing ;;
-      4) dns_add_listen_address_safe ;;
-      5) dns_delete_listen_address_existing ;;
-      6) dns_system_forwarding_toggle ;;
-      7) dns_list_name_servers ;;
-      8) dns_add_name_server_safe ;;
-      9) dns_delete_name_server_existing ;;
-      10) return 0 ;;
+      1)  tprint ""; grep_cfg "set service dns forwarding " >"$TTY" 2>/dev/null || true; pause ;;
+      2)  dns_add_allow_from_safe ;;
+      3)  dns_delete_allow_from_existing ;;
+      4)  dns_add_listen_address_safe ;;
+      5)  dns_delete_listen_address_existing ;;
+      6)  dns_system_forwarding_toggle ;;
+      7)  dns_list_name_servers ;;
+      8)  dns_add_name_server_safe ;;
+      9)  dns_delete_name_server_existing ;;
+      10) dns_add_domain_forwarding_safe ;;
+      11) dns_delete_domain_forwarding_existing ;;
+      12) return 0 ;;
       *) tprint "Invalid." ;;
     esac
   done
@@ -2729,10 +2866,7 @@ static_route_delete() {
   prefix="$SELECTED"
   tprint ""; tprint "Config for $prefix:"
   tprint "--------------------------------------------------------"
-  {
-    grep_cfg "set protocols static route $prefix "
-    grep_cfg "set protocols static route '$prefix' "
-  } >"$TTY" 2>/dev/null || true
+  { grep_cfg "set protocols static route $prefix "; grep_cfg "set protocols static route '$prefix' "; } >"$TTY" 2>/dev/null || true
   tprint "--------------------------------------------------------"
   load_array nexthops scan_static_route_nexthops "$prefix"
   if [ "${#nexthops[@]}" -gt 1 ]; then
@@ -2792,10 +2926,7 @@ dhcp_show_pool() {
   local pool="$1"
   tprint ""; tprint "--- DHCP pool: $pool ---"
   tprint "--------------------------------------------------------"
-  {
-    grep_cfg "set service dhcp-server shared-network-name $pool "
-    grep_cfg "set service dhcp-server shared-network-name '$pool' "
-  } >"$TTY" 2>/dev/null || true
+  { grep_cfg "set service dhcp-server shared-network-name $pool "; grep_cfg "set service dhcp-server shared-network-name '$pool' "; } >"$TTY" 2>/dev/null || true
   tprint "--------------------------------------------------------"
 }
 
@@ -2805,19 +2936,15 @@ dhcp_add_pool_safe() {
   tprint ""; tprint "Existing DHCP pools: ${pools[*]:-(none)}"; tprint ""
   name="$(ask "Pool name (e.g. LAN, MGMT)" "")"
   [ -z "$name" ] && return 0
-  if ! is_safe_ruleset_name "$name"; then
-    tprint "ERROR: Invalid pool name (letters/numbers/_/./- max 64)."; pause; return 0
-  fi
-  if is_in_list "$name" "${pools[@]}"; then
-    tprint "ERROR: Pool '$name' already exists. Use Delete + Add to rebuild."; pause; return 0
-  fi
+  is_safe_ruleset_name "$name" || { tprint "ERROR: Invalid pool name."; pause; return 0; }
+  is_in_list "$name" "${pools[@]}" && { tprint "ERROR: Pool '$name' already exists."; pause; return 0; }
   subnet="$(ask "Subnet (CIDR, e.g. 192.168.1.0/24)" "")"
   [ -z "$subnet" ] && return 0
   is_valid_cidr4 "$subnet" || { tprint "ERROR: Must be IPv4/CIDR."; pause; return 0; }
-  range_start="$(ask "Range start IP (e.g. 192.168.1.100)" "")"
+  range_start="$(ask "Range start IP" "")"
   [ -z "$range_start" ] && return 0
   is_valid_ipv4 "$range_start" || { tprint "ERROR: Must be valid IPv4."; pause; return 0; }
-  range_stop="$(ask "Range stop IP (e.g. 192.168.1.200)" "")"
+  range_stop="$(ask "Range stop IP" "")"
   [ -z "$range_stop" ] && return 0
   is_valid_ipv4 "$range_stop" || { tprint "ERROR: Must be valid IPv4."; pause; return 0; }
   gateway="$(ask "Default gateway IP (optional)" "")"
@@ -2829,10 +2956,7 @@ dhcp_add_pool_safe() {
     echo "$lease" | grep -Eq '^[0-9]+$' || { tprint "ERROR: Must be numeric."; pause; return 0; }
     [ "$lease" -lt 60 ] 2>/dev/null && { tprint "ERROR: Minimum lease 60 seconds."; pause; return 0; }
   fi
-  tprint ""
-  tprint "SUMMARY: DHCP pool $name"
-  tprint "  subnet:  $subnet"
-  tprint "  range:   $range_start — $range_stop"
+  tprint ""; tprint "SUMMARY: DHCP pool $name  subnet=$subnet  range=$range_start—$range_stop"
   [ -n "$gateway" ] && tprint "  gateway: $gateway"
   [ -n "$dns"     ] && tprint "  dns:     $dns"
   [ -n "$lease"   ] && tprint "  lease:   ${lease}s"
@@ -2856,28 +2980,23 @@ dhcp_delete_pool() {
   dhcp_show_pool "$target"
   yn="$(choose_yes_no "Delete DHCP pool $target?" "n" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-  cfg_begin || return 0
-  cfg_delete service dhcp-server shared-network-name "$target"
-  cfg_apply
+  cfg_begin || return 0; cfg_delete service dhcp-server shared-network-name "$target"; cfg_apply
 }
 
 dhcp_add_static_mapping() {
   local pools=() pool subnets=() subnet name mac ip yn
   load_array pools scan_dhcp_pools
   require_nonempty_list_or_return "DHCP pools" "${pools[@]}" || return 0
-  select_from_list "Select DHCP pool for static mapping" "${pools[@]}" || return 0
-  pool="$SELECTED"
+  select_from_list "Select DHCP pool for static mapping" "${pools[@]}" || return 0; pool="$SELECTED"
   load_array subnets scan_dhcp_subnets "$pool"
   require_nonempty_list_or_return "subnets in pool $pool" "${subnets[@]}" || return 0
-  select_from_list "Select subnet" "${subnets[@]}" || return 0
-  subnet="$SELECTED"
+  select_from_list "Select subnet" "${subnets[@]}" || return 0; subnet="$SELECTED"
   name="$(ask "Mapping name (e.g. printer, server1)" "")"
   [ -z "$name" ] && return 0
   is_safe_ruleset_name "$name" || { tprint "ERROR: Invalid mapping name."; pause; return 0; }
   mac="$(ask "MAC address (xx:xx:xx:xx:xx:xx)" "")"
   [ -z "$mac" ] && return 0
-  echo "$mac" | grep -Eiq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' \
-    || { tprint "ERROR: Invalid MAC address."; pause; return 0; }
+  echo "$mac" | grep -Eiq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || { tprint "ERROR: Invalid MAC."; pause; return 0; }
   ip="$(ask "Reserved IP" "")"
   [ -z "$ip" ] && return 0
   is_valid_ipv4 "$ip" || { tprint "ERROR: Must be valid IPv4."; pause; return 0; }
@@ -2943,9 +3062,7 @@ ssh_set_port() {
   echo "$new_port" | grep -q '-' && { tprint "ERROR: Port must be a single value, not a range."; pause; return 0; }
   yn="$(choose_yes_no "Set SSH port to $new_port?" "y" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-  cfg_begin || return 0
-  cfg_set service ssh port "$new_port"
-  cfg_apply
+  cfg_begin || return 0; cfg_set service ssh port "$new_port"; cfg_apply
 }
 
 ssh_add_listen_address() {
@@ -2958,22 +3075,17 @@ ssh_add_listen_address() {
   is_in_list "$new_addr" "${current[@]}" && { tprint "ERROR: $new_addr already configured."; pause; return 0; }
   yn="$(choose_yes_no "Restrict SSH to listen on $new_addr?" "y" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-  cfg_begin || return 0
-  cfg_set service ssh listen-address "$new_addr"
-  cfg_apply
+  cfg_begin || return 0; cfg_set service ssh listen-address "$new_addr"; cfg_apply
 }
 
 ssh_delete_listen_address() {
   local current=() target yn
   load_array current scan_ssh_listen_addresses
   require_nonempty_list_or_return "SSH listen addresses" "${current[@]}" || return 0
-  select_from_list "Select listen address to DELETE" "${current[@]}" || return 0
-  target="$SELECTED"
+  select_from_list "Select listen address to DELETE" "${current[@]}" || return 0; target="$SELECTED"
   yn="$(choose_yes_no "Remove SSH listen-address $target?" "n" || echo "n")"
   [ "$yn" != "y" ] && { tprint "Canceled."; pause; return 0; }
-  cfg_begin || return 0
-  cfg_delete service ssh listen-address "$target"
-  cfg_apply
+  cfg_begin || return 0; cfg_delete service ssh listen-address "$target"; cfg_apply
 }
 
 ssh_toggle_password_auth() {

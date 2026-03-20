@@ -1625,14 +1625,22 @@ zone_management_menu() {
 # directly, consistent with the rest of the script.
 
 # Return 0 (true) if default-log is set for a given policy name.
-# FIX-QC4: trailing space added to grep pattern so "DMZ" cannot
-# falsely match "DMZ-to-LAN" — exact policy name required.
+#
+# FIX: default-log is a boolean flag — the config line ends exactly at
+# "default-log" with nothing after it:
+#   set firewall ipv4 name 'DMZ-to-LAN' default-log
+#
+# Two grep passes to cover both quoted and unquoted forms in the cache.
+# grep_cfg uses grep -F (fixed-string), so we pipe its output through a
+# second grep with a word-boundary pattern using grep -w to ensure
+# "DMZ-to-LAN" does not partially match "DMZ-to-LAN-extra".
+# The final grep -qF "default-log" confirms the flag is present on that line.
 fw_policy_has_default_log() {
   local policy="$1"
   {
-    grep_cfg "set firewall ipv4 name $policy default-log "
-    grep_cfg "set firewall ipv4 name '$policy' default-log "
-  } | grep -q . 2>/dev/null
+    grep_cfg "set firewall ipv4 name '$policy' default-log"
+    grep_cfg "set firewall ipv4 name $policy default-log"
+  } | grep -qF "default-log" 2>/dev/null
 }
 
 # Return the default-action value for a given policy, or '-' if unset.
@@ -1681,7 +1689,7 @@ fw_zone_logging_audit() {
 
     # Header
     tprintf "  %-${col_pol}s  %-${col_act}s  %s\n" "Policy" "Default-action" "Logging"
-    tprint "  "; _fw_divider
+    _fw_divider
 
     missing=()
     for policy in "${policies[@]}"; do
@@ -1705,7 +1713,7 @@ fw_zone_logging_audit() {
         "$policy" "$da_display" "$log_state"
     done
 
-    tprint "  "; _fw_divider
+    _fw_divider
 
     # ── All clean ────────────────────────────────────────────────
     if [ "${#missing[@]}" -eq 0 ]; then
@@ -1739,16 +1747,31 @@ fw_zone_logging_audit() {
     fi
 
     # ── Apply fix ────────────────────────────────────────────────
-    # FIX-QC1: no recursive call — loop continues for re-audit pass.
+    # Only stage policies confirmed MISSING by fw_policy_has_default_log —
+    # this avoids the "already exists" noise from cfg_set on policies that
+    # VyOS already has default-log set on.
     cfg_begin || return 0
     tprint ""
     tprint "Staging default-log commands..."
+    local staged=0
     for p in "${missing[@]}"; do
+      # Double-check: skip if somehow already set (cache may have been stale)
+      if fw_policy_has_default_log "$p"; then
+        tprintf "  (already set, skipping) %s\n" "$p" >"$TTY"
+        continue
+      fi
       tprintf "  set firewall ipv4 name '%s' default-log\n" "$p" >"$TTY"
       cfg_set firewall ipv4 name "$p" default-log
+      staged=$((staged+1))
     done
     tprint ""
-    cfg_apply   # commits, saves, invalidates cache, pauses
+    if [ "$staged" -eq 0 ]; then
+      tprint "  NOTE: All policies already had default-log set — nothing staged."
+      cfg_end
+      cfg_cache_invalidate
+    else
+      cfg_apply   # commits, saves, invalidates cache, pauses
+    fi
 
     # Loop back to re-scan and re-display the audit table
     tprint ""
